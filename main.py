@@ -1,174 +1,170 @@
 import os
 import asyncio
-import logging
+import json
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from dotenv import load_dotenv
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from groq import Groq
+from geopy.geocoders import Nominatim
 
-# Включаем логирование
-logging.basicConfig(level=logging.INFO)
+# --- 1. НАСТРОЙКИ ---
 load_dotenv("keys.env")
-
-# Забираем ключи
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_KEY")
-
-# Настраиваем клиента Groq
-client = Groq(api_key=GROQ_API_KEY)
-bot = Bot(token=TOKEN)
+bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
 dp = Dispatcher()
+client = Groq(api_key=os.getenv("GROQ_KEY"))
+geolocator = Nominatim(user_agent="flywise_bot")
 
-# --- ПАМЯТЬ БОТА (СОСТОЯНИЯ) ---
-class TripPlan(StatesGroup):
+# --- 2. СОСТОЯНИЯ (FSM) ---
+class TravelStates(StatesGroup):
+    waiting_for_departure = State()
+    waiting_for_airport_dep = State()
+    waiting_for_destination = State()
+    waiting_for_airport_dest = State()
+    waiting_for_date = State()
+    waiting_for_return_choice = State()
+    waiting_for_return_date = State()
     waiting_for_budget = State()
-    waiting_for_flight_selection = State()
 
-# --- 1. ПАРСЕР (ВЫТЯГИВАЕТ ДАННЫЕ) ---
-async def extract_info(text):
-    prompt = f"Extract from '{text}': Origin IATA, Dest IATA, Date YYYY-MM-DD. Return ONLY 3 comma-separated values. Example: WAW, MXP, 2026-04-29. Today is March 12, 2026."
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
-        )
-        parts = chat_completion.choices[0].message.content.strip().replace("`", "").split(",")
-        if len(parts) >= 3:
-            return parts[0].strip().upper()[:3], parts[1].strip().upper()[:3], parts[2].strip()
-        return "WAW", "MXP", "2026-04-29"
-    except Exception as e:
-        logging.error(f"Extract Error: {e}")
-        return "WAW", "MXP", "2026-04-29"
+# --- 3. ФУНКЦИИ ПОМОЩНИКИ ---
+async def get_airports(city):
+    """Просим ИИ найти аэропорты в городе"""
+    prompt = f"List major commercial airports in {city}. Return ONLY a JSON list of objects with 'name' and 'iata'. Example: [{{'name': 'Heathrow', 'iata': 'LHR'}}]. No other text."
+    chat_completion = client.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        model="llama-3.3-70b-versatile",
+        response_format={"type": "json_object"}
+    )
+    data = json.loads(chat_completion.choices[0].message.content)
+    # Ищем ключ, так как ИИ может вернуть его под разными именами (airports, list и т.д.)
+    for key in data:
+        if isinstance(data[key], list):
+            return data[key]
+    return []
 
-# --- 2. ПРИВЕТСТВИЕ /start ---
+# --- 4. ПРИВЕТСТВИЕ И ЛОКАЦИЯ ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
-    welcome_text = (
-        "🌍 **Welcome to FlyWise!**\n\n"
-        "Your personal premium travel planner. I find the best routes, "
-        "cozy hotels, and delicious local food tailored to your exact needs.\n\n"
-        "Tell me where and when you want to go.\n"
-        "💬 *Example: 'Warsaw to Tokyo on March 25'*"
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📍 Send My Location", request_location=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
     )
-    await message.answer(welcome_text, parse_mode="Markdown")
-
-# --- 3. ЛОВИМ ГОРОДА И СПРАШИВАЕМ БЮДЖЕТ ---
-@dp.message(StateFilter(None))
-async def handle_route(message: types.Message, state: FSMContext):
-    status = await message.answer("🔍 *Analyzing destinations...*", parse_mode="Markdown")
-    
-    origin, dest, date = await extract_info(message.text)
-    await state.update_data(origin=origin, dest=dest, date=date)
-    await state.set_state(TripPlan.waiting_for_budget)
-    
-    await status.edit_text(
-        f"🎯 **Destination locked:** {origin} ➡️ {dest} on {date}\n\n"
-        f"💸 **What is your flight budget?** (e.g., '150 EUR', '$50', or 'cheapest possible')"
+    await message.answer(
+        "🌍 **Welcome to FlyWise!**\n\nWhere are you flying from?\nClick the button below or type the city name.",
+        parse_mode="Markdown",
+        reply_markup=kb
     )
+    await state.set_state(TravelStates.waiting_for_departure)
 
-# --- 4. ШАГ 1: ГЕНЕРИРУЕМ ТОЛЬКО БИЛЕТЫ И КНОПКИ ---
-@dp.message(TripPlan.waiting_for_budget)
-async def handle_budget(message: types.Message, state: FSMContext):
-    budget = message.text
-    status = await message.answer("✈️ *Hunting for the best flights...*", parse_mode="Markdown")
-    
-    user_data = await state.get_data()
-    origin, dest, date = user_data.get('origin', 'WAW'), user_data.get('dest', 'MXP'), user_data.get('date', '2026-04-20')
-    
-    # Жесткий промпт: запрещаем ныть и просим только 2 рейса со временем
-    flight_prompt = f"""
-    Find 2 flight options from {origin} to {dest} on {date}. User's budget is {budget}.
-    
-    STRICT RULES:
-    1. NO APOLOGIES, NO LONG EXPLANATIONS about budget difficulty. 
-    2. If the budget is impossible, simply say: "No flights found for this budget. Here are the absolute cheapest options:"
-    3. You MUST provide exact or estimated Departure and Arrival Times.
-    4. Format exactly like this:
-    ✈️ **Option 1: [Airline Name]**
-    🕒 [Time] - [Time]
-    💸 Price: [Price]
-    
-    START DIRECTLY WITH THE OPTIONS. Make it bright and attractive.
-    """
-    
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": flight_prompt}],
-            model="llama-3.3-70b-versatile",
-        )
-        flight_response = chat_completion.choices[0].message.content
-        
-        # Создаем красивые кнопки
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🛫 Choose Option 1", callback_data="flight_1")],
-            [InlineKeyboardButton(text="🛫 Choose Option 2", callback_data="flight_2")]
-        ])
-        
-        await status.edit_text(flight_response, parse_mode="Markdown", reply_markup=keyboard)
-        await state.set_state(TripPlan.waiting_for_flight_selection)
-        
-    except Exception as e:
-        logging.error(f"Flight Gen Error: {e}")
-        await status.edit_text("❌ Connection error. Please try again.")
+@dp.message(TravelStates.waiting_for_departure)
+async def process_departure(message: types.Message, state: FSMContext):
+    city_name = ""
+    if message.location:
+        location = geolocator.reverse(f"{message.location.latitude}, {message.location.longitude}")
+        address = location.raw.get('address', {})
+        city_name = address.get('city') or address.get('town') or address.get('village')
+    else:
+        city_name = message.text
 
-# --- 5. ШАГ 2: ОБРАБОТКА НАЖАТИЯ КНОПКИ (ССЫЛКА + ОТЕЛИ) ---
-@dp.callback_query(F.data.startswith("flight_"))
-async def process_flight_selection(callback: types.CallbackQuery, state: FSMContext):
-    # Убираем "часики" с кнопки в Телеграме
-    await callback.answer() 
+    await state.update_data(dep_city=city_name)
+    await message.answer(f"Searching for airports in {city_name}...", reply_markup=types.ReplyKeyboardRemove())
     
-    # Редактируем старое сообщение, убирая кнопки
-    await callback.message.edit_reply_markup(reply_markup=None)
+    airports = await get_airports(city_name)
+    if not airports:
+        await message.answer("I couldn't find specific airports. Please type your departure airport IATA code (e.g., WAW):")
+        await state.set_state(TravelStates.waiting_for_airport_dep)
+        return
+
+    buttons = [[InlineKeyboardButton(text=f"{a['name']} ({a['iata']})", callback_data=f"air_dep_{a['iata']}")] for a in airports]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer("Please select your departure airport:", reply_markup=keyboard)
+    await state.set_state(TravelStates.waiting_for_airport_dep)
+
+@dp.callback_query(F.data.startswith("air_dep_"))
+async def select_dep_airport(callback: types.CallbackQuery, state: FSMContext):
+    iata = callback.data.replace("air_dep_", "")
+    await state.update_data(dep_iata=iata)
+    await callback.message.edit_text(f"Departure airport set to: **{iata}**", parse_mode="Markdown")
+    await callback.message.answer("Now, where do you want to go? (Type the city name)")
+    await state.set_state(TravelStates.waiting_for_destination)
+
+# --- 5. ПУНКТ НАЗНАЧЕНИЯ ---
+@dp.message(TravelStates.waiting_for_destination)
+async def process_destination(message: types.Message, state: FSMContext):
+    city_name = message.text
+    await state.update_data(dest_city=city_name)
     
-    status = await callback.message.answer("🎉 *Excellent choice! Preparing your booking links and local guide...*", parse_mode="Markdown")
+    airports = await get_airports(city_name)
+    if not airports:
+        await message.answer(f"Please type the IATA code for {city_name} (e.g., LHR):")
+        await state.set_state(TravelStates.waiting_for_airport_dest)
+        return
+
+    buttons = [[InlineKeyboardButton(text=f"{a['name']} ({a['iata']})", callback_data=f"air_dest_{a['iata']}")] for a in airports]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer(f"Select airport in {city_name}:", reply_markup=keyboard)
+    await state.set_state(TravelStates.waiting_for_airport_dest)
+
+@dp.callback_query(F.data.startswith("air_dest_"))
+async def select_dest_airport(callback: types.CallbackQuery, state: FSMContext):
+    iata = callback.data.replace("air_dest_", "")
+    await state.update_data(dest_iata=iata)
+    await callback.message.edit_text(f"Destination set to: **{iata}**", parse_mode="Markdown")
+    await callback.message.answer("What is your departure date? (e.g., March 25)")
+    await state.set_state(TravelStates.waiting_for_date)
+
+# --- 6. ДАТЫ И ОБРАТНЫЙ БИЛЕТ ---
+@dp.message(TravelStates.waiting_for_date)
+async def process_date(message: types.Message, state: FSMContext):
+    await state.update_data(dep_date=message.text)
     
-    user_data = await state.get_data()
-    origin, dest, date = user_data.get('origin', 'WAW'), user_data.get('dest', 'MXP'), user_data.get('date', '2026-04-20')
-    
-    # Очищаем память
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Yes, please! ✅", callback_data="return_yes")],
+        [InlineKeyboardButton(text="No, one-way only ✈️", callback_data="return_no")]
+    ])
+    await message.answer("Do you need a return flight?", reply_markup=kb)
+    await state.set_state(TravelStates.waiting_for_return_choice)
+
+@dp.callback_query(F.data == "return_yes")
+async def return_yes(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Great! When do you want to fly back? (e.g., April 5)")
+    await state.set_state(TravelStates.waiting_for_return_date)
+
+@dp.callback_query(F.data == "return_no")
+async def return_no(callback: types.CallbackQuery, state: FSMContext):
+    await state.update_data(return_date=None)
+    await callback.message.edit_text("Got it. One-way trip.")
+    await callback.message.answer("What is your total budget for flights (e.g., $500)?")
+    await state.set_state(TravelStates.waiting_for_budget)
+
+@dp.message(TravelStates.waiting_for_return_date)
+async def process_return_date(message: types.Message, state: FSMContext):
+    await state.update_data(return_date=message.text)
+    await message.answer("What is your total budget for flights (e.g., $800)?")
+    await state.set_state(TravelStates.waiting_for_budget)
+
+# --- 7. ФИНАЛЬНЫЙ ПОИСК (Упрощенно для теста логики) ---
+@dp.message(TravelStates.waiting_for_budget)
+async def process_budget(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    # Тут будет вызов ИИ для поиска (как в прошлой версии), 
+    # но теперь с учетом return_date, если она есть.
+    summary = (
+        f"✅ Trip Configured!\n"
+        f"From: {data['dep_city']} ({data['dep_iata']})\n"
+        f"To: {data['dest_city']} ({data['dest_iata']})\n"
+        f"Departure: {data['dep_date']}\n"
+        f"Return: {data.get('return_date') or 'One-way'}\n"
+        f"Budget: {message.text}"
+    )
+    await message.answer(summary)
     await state.clear()
-    
-    # Формируем ссылку на Google Flights
-    google_flights_url = f"https://www.google.com/travel/flights?q=Flights%20from%20{origin}%20to%20{dest}%20on%20{date}"
-    
-    # Промпт для отелей и еды
-    hotel_prompt = f"""
-    The user just booked a flight to {dest}. Act as FlyWise and provide:
-    1. HOTELS: 3 options (Budget, Mid-range, Luxury) with real names. 
-    FORMAT LINK EXACTLY LIKE THIS: `[Search on Booking](https://www.booking.com/searchresults.html?ss=Hotel+Name+{dest})` (replace spaces in hotel name with +).
-    2. DINING: 3 highly-rated local restaurants with their signature dishes.
-    
-    RULES: Use bold titles, NO markdown headers (#), use emojis, make it vibrant and welcoming.
-    """
-    
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": hotel_prompt}],
-            model="llama-3.3-70b-versatile",
-        )
-        hotel_response = chat_completion.choices[0].message.content
-        
-        # Склеиваем ссылку на билет и ответ ИИ по отелям
-        final_message = (
-            f"✅ **Your flight is ready to be booked!**\n"
-            f"👉 [Click here to book your tickets securely]({google_flights_url})\n\n"
-            f"--- \n\n"
-            f"{hotel_response}"
-        )
-        
-        await status.edit_text(final_message, parse_mode="Markdown", disable_web_page_preview=True)
-        
-    except Exception as e:
-        logging.error(f"Hotel Gen Error: {e}")
-        await status.edit_text("❌ Error loading the guide. Your flight link is ready though!")
 
-# --- ЗАПУСК ---
 async def main():
-    print("🚀 FlyWise is online with interactive buttons and smart links!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
